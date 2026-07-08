@@ -36,7 +36,7 @@ DPI (глубокая проверка пакетов) — соединение 
 * netpulse dns set <n>  - Установить DNS (google, cloudflare, yandex... **Из списка**)
 * netpulse dns backup   - Сохранить текущие DNS( **На доработке** )
 * netpulse dns restore  - Восстановить DNS из бэкапа( **На доработке** )
-* netpulse ping *<host>*  - Пинг **конкретного** хоста
+* netpulse ping *host*  - Пинг **конкретного** хоста
 * netpulse bench        - Бенчмарк всех DNS( **На доработке** )
 
 
@@ -90,7 +90,7 @@ DPI (глубокая проверка пакетов) — соединение 
 
 **📡 Список тестируемых ресурсов** 
 
-При запуске команды *<netpulse ping>* программа проверяет доступность следующих групп ресурсов через TCP-порт 443:
+При запуске команды *netpulse ping* программа проверяет доступность следующих групп ресурсов через TCP-порт 443:
 
 *    Development: GitHub (основной домен, API, Raw-контент, Pages).
 *    AI Services: Google Gemini, Google AI Studio, Kimi (Moonshot AI).
