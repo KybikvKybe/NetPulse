@@ -1,0 +1,272 @@
+package ping
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"os/exec"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+)
+
+type Result struct {
+	Target      string
+	IP          string
+	PacketsSent int
+	PacketsRecv int
+	PacketLoss  float64
+	MinRTT      float64
+	AvgRTT      float64
+	MaxRTT      float64
+	StdDevRTT   float64
+	ResolveTime time.Duration
+	PingTime    time.Duration
+	Timestamps  []float64
+	Error       string
+}
+
+type Engine struct {
+	Count   int
+	Timeout int
+}
+
+func NewEngine(count, timeout int) *Engine {
+	return &Engine{Count: count, Timeout: timeout}
+}
+
+func (e *Engine) Ping(target string) *Result {
+	result := &Result{Target: target, PacketsSent: e.Count}
+
+	// 1. Резолвим IP
+	start := time.Now()
+	ip, err := e.resolveWithCustomDNS(target)
+	result.ResolveTime = time.Since(start)
+	if err != nil {
+		result.Error = fmt.Sprintf("resolve failed: %v", err)
+		result.PacketLoss = 100
+		return result
+	}
+	result.IP = ip
+
+	// 2. Запуск системного пинга
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(e.Timeout*3)*time.Millisecond)
+	defer cancel()
+
+	start = time.Now()
+	output, err := e.runPing(ctx, target) 
+	result.PingTime = time.Since(start)
+
+	// ВНИМАНИЕ: Даже если err != nil (exit status 1), 
+	// нам НУЖЕН output, потому что там может быть написано "потеряно 25%"
+	if output == "" {
+		if err != nil {
+			result.Error = fmt.Sprintf("system ping failed: %v", err)
+			result.PacketLoss = 100
+			return result
+		}
+	}
+
+	// Парсим вывод в любом случае
+	parsedResult := e.parsePingOutput(output, result)
+	
+	// Если после парсинга всё еще 100% потерь, пробуем TCP fallback
+	if parsedResult.PacketLoss == 100 {
+		return e.tcpPing(target, parsedResult)
+	}
+
+	return parsedResult
+}
+
+func (e *Engine) runPing(ctx context.Context, target string) (string, error) {
+	var cmd *exec.Cmd
+	
+	if runtime.GOOS == "windows" {
+		// Ставим 5000мс, чтобы точно избежать UNREACHABLE из-за короткого таймаута
+		cmd = exec.CommandContext(ctx, "ping", "-n", strconv.Itoa(e.Count), "-w", "5000", target)
+	} else {
+		cmd = exec.CommandContext(ctx, "ping", "-c", strconv.Itoa(e.Count), "-W", "5", target)
+	}
+	
+	output, err := cmd.CombinedOutput()
+	
+	if err != nil {
+		// Оставляем DEBUG, чтобы видеть ошибки в консоли
+		fmt.Printf("DEBUG: ping %s failed: %v\nOutput: %s\n", target, err, string(output))
+	}
+	
+	return string(output), err
+}
+
+func (e *Engine) resolveWithCustomDNS(target string) (string, error) {
+	if net.ParseIP(target) != nil {
+		return target, nil
+	}
+	ips, err := net.LookupIP(target)
+	if err != nil {
+		return "", err
+	}
+	for _, ip := range ips {
+		if ip.To4() != nil {
+			return ip.String(), nil
+		}
+	}
+	if len(ips) > 0 {
+		return ips[0].String(), nil
+	}
+	return "", fmt.Errorf("no IP found")
+}
+
+
+
+func (e *Engine) tcpPing(target string, result *Result) *Result {
+	address := net.JoinHostPort(result.IP, "443")
+	var successful int
+	var rtts []float64
+	for i := 0; i < e.Count; i++ {
+		start := time.Now()
+		conn, err := net.DialTimeout("tcp", address, time.Duration(e.Timeout)*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			rtts = append(rtts, float64(time.Since(start).Milliseconds()))
+			successful++
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	result.PacketsRecv = successful
+	result.PacketLoss = float64(e.Count-successful) / float64(e.Count) * 100
+	result.Timestamps = rtts
+	if len(rtts) > 0 {
+		result.MinRTT, result.MaxRTT, result.AvgRTT = minFloat(rtts), maxFloat(rtts), avgFloat(rtts)
+	}
+	return result
+}
+
+// ИСПРАВЛЕННЫЙ ПАРСИНГ (убирает 0.0ms)
+func (e *Engine) parsePingOutput(output string, result *Result) *Result {
+	// 1. Извлекаем IP (ищем просто паттерн IP адреса)
+	ipRe := regexp.MustCompile(`(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`)
+	if matches := ipRe.FindStringSubmatch(output); len(matches) > 0 {
+		result.IP = matches[1]
+	}
+
+	// 2. Извлекаем процент потерь (ищем число перед знаком %)
+	lossRe := regexp.MustCompile(`(\d+)%`)
+	if matches := lossRe.FindStringSubmatch(output); len(matches) > 1 {
+		result.PacketLoss, _ = strconv.ParseFloat(matches[1], 64)
+	} else {
+		// Если знак % не найден, но есть текст "потеряно = 0" или "loss = 0"
+		if strings.Contains(output, "потеряно = 0") || strings.Contains(output, "loss = 0") {
+			result.PacketLoss = 0
+		} else {
+			result.PacketLoss = 100
+		}
+	}
+
+	// 3. ИЗВЛЕКАЕМ ВРЕМЯ (Самый надежный способ)
+	// Ищем вообще все числа, которые похожи на время (целые или с точкой)
+	// Мы ищем числа, которые стоят рядом с буквами 'м', 's' или 'ms'
+	timeRe := regexp.MustCompile(`(\d+\.?\d*)\s*(?:мс|мсек|ms|msec)`)
+	allMatches := timeRe.FindAllStringSubmatch(output, -1)
+
+	if len(allMatches) > 0 {
+		var times []float64
+		for _, m := range allMatches {
+			if len(m) > 1 {
+				val, _ := strconv.ParseFloat(m[1], 64)
+				times = append(times, val)
+			}
+		}
+
+		// В выводе Windows ping последние три числа — это всегда Min, Max, Avg
+		if len(times) >= 3 {
+			lastThree := times[len(times)-3:]
+			result.MinRTT = lastThree[0]
+			result.MaxRTT = lastThree[1]
+			result.AvgRTT = lastThree[2]
+		} else if len(times) > 0 {
+			// Если чисел меньше 3, берем что есть
+			result.AvgRTT = times[len(times)-1]
+		}
+	}
+
+	return result
+}
+
+func (e *Engine) PingAll(targets map[string][]string) map[string][]*Result {
+	results := make(map[string][]*Result)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	semaphore := make(chan struct{}, 20) // чуть уменьшил concurrency для стабильности
+
+	for category, hosts := range targets {
+		for _, host := range hosts {
+			wg.Add(1)
+			go func(cat, h string) {
+				defer wg.Done()
+				semaphore <- struct{}{}
+				defer func() { <-semaphore }()
+				r := e.Ping(h)
+				mu.Lock()
+				results[cat] = append(results[cat], r)
+				mu.Unlock()
+			}(category, host)
+		}
+	}
+	wg.Wait()
+	return results
+}
+
+// ИСПРАВЛЕННЫЙ ВЫВОД (убирает кашу)
+func (e *Engine) PrintReport(results map[string][]*Result) {
+	fmt.Println("\n" + strings.Repeat("=", 80))
+	fmt.Println("📊 ОТЧЁТ ПО ПИНГУ")
+	fmt.Println(strings.Repeat("=", 80))
+
+	for category, pings := range results {
+		fmt.Printf("\n📁 %s\n", strings.ToUpper(category))
+		fmt.Println(strings.Repeat("-", 60))
+		for _, p := range pings {
+			status := "✅"
+			if p.PacketLoss == 100 { status = "❌" } else if p.PacketLoss > 0 { status = "⚠️" }
+			
+			if p.Error != "" {
+				fmt.Printf("  %s %-35s 🔴 %s\n", status, p.Target, p.Error)
+				continue
+			}
+
+			latencyIcon := "🟢"
+			if p.AvgRTT > 150 { latencyIcon = "🔴" } else if p.AvgRTT > 50 { latencyIcon = "🟡" }
+
+			if p.AvgRTT > 0 {
+				fmt.Printf("  %s %-35s %s %6.1fms  (loss: %.0f%%)  IP: %s\n",
+					status, p.Target, latencyIcon, p.AvgRTT, p.PacketLoss, p.IP)
+			} else {
+				fmt.Printf("  %s %-35s 🔴 UNREACHABLE  IP: %s\n", status, p.Target, p.IP)
+			}
+		}
+	}
+}
+
+// Вспомогательные функции
+func minFloat(vals []float64) float64 {
+	if len(vals) == 0 { return 0 }
+	m := vals[0]
+	for _, v := range vals { if v < m { m = v } }
+	return m
+}
+func maxFloat(vals []float64) float64 {
+	if len(vals) == 0 { return 0 }
+	m := vals[0]
+	for _, v := range vals { if v > m { m = v } }
+	return m
+}
+func avgFloat(vals []float64) float64 {
+	if len(vals) == 0 { return 0 }
+	var sum float64
+	for _, v := range vals { sum += v }
+	return sum / float64(len(vals))
+}

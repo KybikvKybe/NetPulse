@@ -1,0 +1,49 @@
+package main
+
+import (
+	"fmt"
+	"net"
+	"os/exec"
+
+)
+
+func main() {
+	fmt.Println("=== DEBUG START ===")
+	
+	// 1. Проверяем адаптеры через Go
+	ifaces, _ := net.Interfaces()
+	fmt.Println("Найдено интерфейсов:", len(ifaces))
+	
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagLoopback == 0 {
+			fmt.Printf("Активный интерфейс: Name=%s, Index=%d\n", iface.Name, iface.Index)
+		}
+	}
+
+	// 2. Пробуем сменить DNS через индекс самого первого активного интерфейса
+	var activeIdx string
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp != 0 && iface.Flags&net.FlagLoopback == 0 {
+			activeIdx = fmt.Sprintf("%d", iface.Index)
+			break
+		}
+	}
+
+	if activeIdx == "" {
+		fmt.Println("❌ Активный адаптер не найден!")
+		return
+	}
+
+	fmt.Printf("Пробую сменить DNS для интерфейса %s...\n", activeIdx)
+	
+	// Команда: netsh interface ip set dns interface=Индекс static 8.8.8.8 primary
+	cmd := exec.Command("netsh", "interface", "ip", "set", "dns", "interface="+activeIdx, "static", "8.8.8.8", "primary")
+	out, err := cmd.CombinedOutput()
+	
+	if err != nil {
+		fmt.Printf("❌ ОШИБКА: %v\n", err)
+		fmt.Printf("ОТВЕТ СИСТЕМЫ: %s\n", string(out))
+	} else {
+		fmt.Println("✅ УСПЕХ! DNS изменен на 8.8.8.8")
+	}
+}
